@@ -18,7 +18,7 @@ from telegram.ext import (
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 KITCHEN_CHAT_ID = int(os.environ["KITCHEN_CHAT_ID"])
 ADMIN_ID = int(os.environ["ADMIN_ID"])
-# IDs des cuisiniers/restaurant séparés par virgule ex: "123456,789012"
+DIRECTION_CHAT_ID = int(os.environ["DIRECTION_CHAT_ID"])
 KITCHEN_USER_IDS = set(
     int(x.strip()) for x in os.environ.get("KITCHEN_USER_IDS", "").split(",") if x.strip()
 )
@@ -42,11 +42,21 @@ def save_stats(stats):
 
 def record_order(items):
     stats = load_stats()
-    month_key = datetime.now().strftime("%Y-%m")
-    if month_key not in stats:
-        stats[month_key] = {}
-    for item_id in items:
-        stats[month_key][item_id] = stats[month_key].get(item_id, 0) + 1
+    now = datetime.now()
+    month_key = now.strftime("%Y-%m")
+    day_key = now.strftime("%Y-%m-%d")
+    for key in [month_key, day_key]:
+        if key not in stats:
+            stats[key] = {}
+        for item_id in items:
+            stats[key][item_id] = stats[key].get(item_id, 0) + 1
+    # Compter aussi le nombre de commandes
+    if "__orders__" not in stats:
+        stats["__orders__"] = {}
+    for key in [month_key, day_key]:
+        if key not in stats["__orders__"]:
+            stats["__orders__"][key] = 0
+        stats["__orders__"][key] += 1
     save_stats(stats)
 
 # ─────────────────────────────────────────────
@@ -68,35 +78,60 @@ def get_item_name(item_id):
     return item_id
 
 # ─────────────────────────────────────────────
-#  RAPPORT
+#  RAPPORTS
 # ─────────────────────────────────────────────
-def build_rapport(month_key):
+UA_MONTHS = {
+    1: "Січень", 2: "Лютий", 3: "Березень", 4: "Квітень",
+    5: "Травень", 6: "Червень", 7: "Липень", 8: "Серпень",
+    9: "Вересень", 10: "Жовтень", 11: "Листопад", 12: "Грудень",
+}
+UA_MONTHS_GEN = {
+    1: "Січня", 2: "Лютого", 3: "Березня", 4: "Квітня",
+    5: "Травня", 6: "Червня", 7: "Липня", 8: "Серпня",
+    9: "Вересня", 10: "Жовтня", 11: "Листопада", 12: "Грудня",
+}
+
+def build_period_report(key, title):
     stats = load_stats()
-    data = stats.get(month_key, {})
-    year, month = map(int, month_key.split("-"))
-    UA_MONTHS = {
-        1: "Січень", 2: "Лютий", 3: "Березень", 4: "Квітень",
-        5: "Травень", 6: "Червень", 7: "Липень", 8: "Серпень",
-        9: "Вересень", 10: "Жовтень", 11: "Листопад", 12: "Грудень",
-    }
-    month_ua = UA_MONTHS.get(month, str(month))
+    data = stats.get(key, {})
+    orders_count = stats.get("__orders__", {}).get(key, 0)
+
     if not data:
-        return f"📊 *Звіт за {month_ua} {year}*\n\n_(немає даних)_"
+        return f"{title}\n\n_(немає даних)_"
+
     sorted_items = sorted(data.items(), key=lambda x: x[1], reverse=True)
     total = sum(data.values())
-    lines = [f"📊 *Звіт за {month_ua} {year}*\n"]
+    lines = [f"{title}\n"]
+    lines.append(f"Замовлень: *{orders_count}*")
+    lines.append(f"Страв подано: *{total}*\n")
     for item_id, count in sorted_items:
         name = get_item_name(item_id)
-        lines.append(f"• {name} — *{count}*")
-    lines.append(f"\n🍽 Всього страв: *{total}*")
+        lines.append(f"• {name} — {count}")
     return "\n".join(lines)
+
+def build_daily_report(day_key=None):
+    if not day_key:
+        day_key = datetime.now().strftime("%Y-%m-%d")
+    d = datetime.strptime(day_key, "%Y-%m-%d")
+    title = f"📋 Підсумок дня — {d.day} {UA_MONTHS_GEN.get(d.month, '')} {d.year}"
+    return build_period_report(day_key, title)
+
+def build_monthly_report(month_key=None):
+    if not month_key:
+        now = datetime.now()
+        if now.month == 1:
+            month_key = f"{now.year - 1}-12"
+        else:
+            month_key = f"{now.year}-{now.month - 1:02d}"
+    year, month = map(int, month_key.split("-"))
+    title = f"📊 Підсумок місяця — {UA_MONTHS.get(month, '')} {year}"
+    return build_period_report(month_key, title)
 
 # ─────────────────────────────────────────────
 #  ÉTAT
 # ─────────────────────────────────────────────
 orders = {}
 order_counter = {"n": 0}
-# Stocke waiter_id par order_id pour la notification
 order_waiter = {}
 
 def next_order_id():
@@ -218,7 +253,7 @@ def build_kitchen_keyboard(order_id):
     ]])
 
 # ─────────────────────────────────────────────
-#  HANDLERS
+#  HANDLERS COMMANDES
 # ─────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -228,20 +263,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def new_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     orders[user_id] = {"table": None, "table_label": None, "items": [], "page": 0}
-    await update.message.reply_text(
-        "Вибери зону:",
-        reply_markup=build_zones_keyboard()
-    )
+    await update.message.reply_text("Вибери зону:", reply_markup=build_zones_keyboard())
 
 async def rapport(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     if user_id != ADMIN_ID:
         await update.message.reply_text("⛔️ Команда недоступна.")
         return
-    now = datetime.now()
-    month_key = f"{now.year - 1}-12" if now.month == 1 else f"{now.year}-{now.month - 1:02d}"
-    text = build_rapport(month_key)
-    await context.bot.send_message(chat_id=KITCHEN_CHAT_ID, text=text, parse_mode="Markdown")
+    text = build_monthly_report()
+    await context.bot.send_message(chat_id=DIRECTION_CHAT_ID, text=text, parse_mode="Markdown")
     await update.message.reply_text("✅ Звіт відправлено.")
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -251,20 +281,17 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     waiter_name = query.from_user.first_name or "Офіціант"
     await query.answer()
 
-    # CANCEL
     if data == "CANCEL":
         orders.pop(user_id, None)
         await query.edit_message_text("Замовлення скасовано.")
         return
 
-    # BACK TO ZONES
     if data == "BACK_ZONES":
         if user_id not in orders:
             orders[user_id] = {"table": None, "table_label": None, "items": [], "page": 0}
         await query.edit_message_text("Вибери зону:", reply_markup=build_zones_keyboard())
         return
 
-    # ZONE SELECTED
     if data.startswith("ZONE_"):
         if user_id not in orders:
             orders[user_id] = {"table": None, "table_label": None, "items": [], "page": 0}
@@ -279,7 +306,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # TABLE SELECTED
     if data.startswith("TABLE_"):
         if user_id not in orders:
             orders[user_id] = {"table": None, "table_label": None, "items": [], "page": 0}
@@ -299,7 +325,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # PAGINATION
     if data.startswith("PAGE_"):
         if user_id not in orders:
             await query.edit_message_text("Сесія закінчилась. Натисни /new")
@@ -315,7 +340,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ADD ITEM
     if data.startswith("ADD_"):
         if user_id not in orders:
             await query.edit_message_text("Сесія закінчилась. Натисни /new")
@@ -332,7 +356,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # SHOW CART
     if data == "SHOW_CART":
         if user_id not in orders:
             await query.edit_message_text("Сесія закінчилась. Натисни /new")
@@ -346,7 +369,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # REMOVE LIST
     if data == "REMOVE_LIST":
         if user_id not in orders:
             await query.edit_message_text("Сесія закінчилась. Натисни /new")
@@ -363,7 +385,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # REMOVE ONE ITEM
     if data.startswith("REMOVE_"):
         if user_id not in orders:
             await query.edit_message_text("Сесія закінчилась. Натисни /new")
@@ -387,7 +408,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # SEND ORDER
     if data == "SEND":
         if user_id not in orders:
             await query.edit_message_text("Сесія закінчилась. Натисни /new")
@@ -401,7 +421,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_id = next_order_id()
         kitchen_text = format_order_for_kitchen(order_id, table_label, items, waiter_name)
         record_order(items)
-        # Mémoriser le waiter pour la notification
         order_waiter[order_id] = user_id
         await context.bot.send_message(
             chat_id=KITCHEN_CHAT_ID,
@@ -416,18 +435,14 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         orders.pop(user_id, None)
         return
 
-    # KITCHEN STATUS — réservé aux cuisiniers
     if data.startswith("STATUS_"):
-        # Vérifier que c'est bien un cuisinier
         if KITCHEN_USER_IDS and user_id not in KITCHEN_USER_IDS:
             await query.answer("⛔️ Тільки для кухні.", show_alert=True)
             return
-
         parts = data.split("_")
         status = parts[1]
         order_id_str = parts[2] if len(parts) > 2 else "?"
         now = datetime.now().strftime("%H:%M")
-
         try:
             order_id_int = int(order_id_str)
         except ValueError:
@@ -439,12 +454,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("Готово", callback_data=f"STATUS_READY_{order_id_str}")
             ]])
             await query.edit_message_text(new_text, reply_markup=new_keyboard, parse_mode="Markdown")
-            # Notifier le serveur
             if order_id_int and order_id_int in order_waiter:
-                waiter_id = order_waiter[order_id_int]
                 try:
                     await context.bot.send_message(
-                        chat_id=waiter_id,
+                        chat_id=order_waiter[order_id_int],
                         text=f"🍷 Замовлення #{order_id_str} — кухня прийняла, готується. ({now})"
                     )
                 except Exception:
@@ -453,12 +466,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif status == "READY":
             new_text = query.message.text + f"\n\n— Готово ({now})"
             await query.edit_message_text(new_text, reply_markup=InlineKeyboardMarkup([]), parse_mode="Markdown")
-            # Notifier le serveur
             if order_id_int and order_id_int in order_waiter:
-                waiter_id = order_waiter[order_id_int]
                 try:
                     await context.bot.send_message(
-                        chat_id=waiter_id,
+                        chat_id=order_waiter[order_id_int],
                         text=f"✓ Замовлення #{order_id_str} — готово, можна подавати. ({now})"
                     )
                 except Exception:
@@ -475,7 +486,7 @@ application.add_handler(CommandHandler("rapport", rapport))
 application.add_handler(CallbackQueryHandler(button))
 
 # ─────────────────────────────────────────────
-#  FLASK WEBHOOK
+#  FLASK — WEBHOOK + RAPPORTS AUTOMATIQUES
 # ─────────────────────────────────────────────
 @app_flask.route("/", methods=["POST"])
 async def webhook():
@@ -487,6 +498,29 @@ async def webhook():
 @app_flask.route("/", methods=["GET"])
 def health():
     return "bandôl — alive"
+
+@app_flask.route("/daily", methods=["GET", "POST"])
+async def daily_report():
+    """Appelé par cron-job.org chaque soir à 23h"""
+    yesterday = datetime.now().strftime("%Y-%m-%d")
+    text = build_daily_report(yesterday)
+    await application.bot.send_message(
+        chat_id=DIRECTION_CHAT_ID,
+        text=text,
+        parse_mode="Markdown"
+    )
+    return "ok"
+
+@app_flask.route("/monthly", methods=["GET", "POST"])
+async def monthly_report():
+    """Appelé par cron-job.org le 1er de chaque mois à 9h"""
+    text = build_monthly_report()
+    await application.bot.send_message(
+        chat_id=DIRECTION_CHAT_ID,
+        text=text,
+        parse_mode="Markdown"
+    )
+    return "ok"
 
 if __name__ == "__main__":
     asyncio.run(application.initialize())
