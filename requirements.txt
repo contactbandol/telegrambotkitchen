@@ -1,2 +1,0 @@
-python-telegram-bot[webhooks]==21.3
-flask[async]==3.0.3
