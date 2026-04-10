@@ -9,7 +9,9 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 # ─────────────────────────────────────────────
@@ -23,6 +25,7 @@ KITCHEN_USER_IDS = set(
     int(x.strip()) for x in os.environ.get("KITCHEN_USER_IDS", "").split(",") if x.strip()
 )
 STATS_FILE = "stats.json"
+REMINDER_MINUTES = 4
 
 app_flask = Flask(__name__)
 application = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -50,7 +53,6 @@ def record_order(items):
             stats[key] = {}
         for item_id in items:
             stats[key][item_id] = stats[key].get(item_id, 0) + 1
-    # Compter aussi le nombre de commandes
     if "__orders__" not in stats:
         stats["__orders__"] = {}
     for key in [month_key, day_key]:
@@ -95,18 +97,13 @@ def build_period_report(key, title):
     stats = load_stats()
     data = stats.get(key, {})
     orders_count = stats.get("__orders__", {}).get(key, 0)
-
     if not data:
         return f"{title}\n\n_(немає даних)_"
-
     sorted_items = sorted(data.items(), key=lambda x: x[1], reverse=True)
     total = sum(data.values())
-    lines = [f"{title}\n"]
-    lines.append(f"Замовлень: *{orders_count}*")
-    lines.append(f"Страв подано: *{total}*\n")
+    lines = [f"{title}\n", f"Замовлень: *{orders_count}*", f"Страв подано: *{total}*\n"]
     for item_id, count in sorted_items:
-        name = get_item_name(item_id)
-        lines.append(f"• {name} — {count}")
+        lines.append(f"• {get_item_name(item_id)} — {count}")
     return "\n".join(lines)
 
 def build_daily_report(day_key=None):
@@ -119,10 +116,7 @@ def build_daily_report(day_key=None):
 def build_monthly_report(month_key=None):
     if not month_key:
         now = datetime.now()
-        if now.month == 1:
-            month_key = f"{now.year - 1}-12"
-        else:
-            month_key = f"{now.year}-{now.month - 1:02d}"
+        month_key = f"{now.year - 1}-12" if now.month == 1 else f"{now.year}-{now.month - 1:02d}"
     year, month = map(int, month_key.split("-"))
     title = f"📊 Підсумок місяця — {UA_MONTHS.get(month, '')} {year}"
     return build_period_report(month_key, title)
@@ -133,15 +127,36 @@ def build_monthly_report(month_key=None):
 orders = {}
 order_counter = {"n": 0}
 order_waiter = {}
+# Pour le commentaire : état d'attente de texte libre
+awaiting_comment = {}
 
 def next_order_id():
     order_counter["n"] += 1
     return order_counter["n"]
 
 # ─────────────────────────────────────────────
+#  REMINDER — rappel après 4 min sans réponse
+# ─────────────────────────────────────────────
+async def send_reminder(order_id, waiter_id, table_label, bot):
+    await asyncio.sleep(REMINDER_MINUTES * 60)
+    # Si la commande est toujours en attente (pas encore COOKING)
+    if order_id in order_waiter:
+        try:
+            await bot.send_message(
+                chat_id=waiter_id,
+                text=f"⏳ Замовлення #{order_id} — {table_label}\nКухня ще не підтвердила. Перевір!"
+            )
+            await bot.send_message(
+                chat_id=KITCHEN_CHAT_ID,
+                text=f"⚠️ Замовлення #{order_id} — {table_label}\nЧекає підтвердження вже {REMINDER_MINUTES} хвилини!"
+            )
+        except Exception:
+            pass
+
+# ─────────────────────────────────────────────
 #  HELPERS
 # ─────────────────────────────────────────────
-def format_cart(table_label, items):
+def format_cart(table_label, items, comment=None):
     if not items:
         return f"🪑 {table_label}\n\n_(кошик порожній)_"
     counts = {}
@@ -151,9 +166,11 @@ def format_cart(table_label, items):
     for item_id, count in counts.items():
         name = get_item_name(item_id)
         lines.append(f"• {name} ×{count}" if count > 1 else f"• {name}")
+    if comment:
+        lines.append(f"\n📝 _{comment}_")
     return "\n".join(lines)
 
-def format_order_for_kitchen(order_id, table_label, items, waiter_name):
+def format_order_for_kitchen(order_id, table_label, items, waiter_name, comment=None):
     counts = {}
     for i in items:
         counts[i] = counts.get(i, 0) + 1
@@ -167,6 +184,8 @@ def format_order_for_kitchen(order_id, table_label, items, waiter_name):
     for item_id, count in counts.items():
         name = get_item_name(item_id)
         lines.append(f"• {name} ×{count}" if count > 1 else f"• {name}")
+    if comment:
+        lines.append(f"\n📝 *Коментар:* {comment}")
     return "\n".join(lines)
 
 # ─────────────────────────────────────────────
@@ -205,11 +224,9 @@ def build_menu_keyboard(page=0):
     end = min(start + page_size, len(items))
     page_items = items[start:end]
     total_pages = (len(items) + page_size - 1) // page_size
-
     rows = []
     for item in page_items:
         rows.append([InlineKeyboardButton(item["name"], callback_data=f"ADD_{item['id']}")])
-
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("◀️", callback_data=f"PAGE_{page-1}"))
@@ -217,7 +234,6 @@ def build_menu_keyboard(page=0):
         nav.append(InlineKeyboardButton("▶️", callback_data=f"PAGE_{page+1}"))
     if nav:
         rows.append(nav)
-
     rows.append([InlineKeyboardButton("Переглянути кошик", callback_data="SHOW_CART")])
     rows.append([InlineKeyboardButton("Скасувати", callback_data="CANCEL")])
     return InlineKeyboardMarkup(rows)
@@ -226,6 +242,7 @@ def build_cart_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Додати ще", callback_data="PAGE_0")],
         [InlineKeyboardButton("Прибрати страву", callback_data="REMOVE_LIST")],
+        [InlineKeyboardButton("📝 Додати коментар", callback_data="ADD_COMMENT")],
         [InlineKeyboardButton("✓ Відправити замовлення", callback_data="SEND")],
         [InlineKeyboardButton("Скасувати", callback_data="CANCEL")],
     ])
@@ -253,7 +270,7 @@ def build_kitchen_keyboard(order_id):
     ]])
 
 # ─────────────────────────────────────────────
-#  HANDLERS COMMANDES
+#  HANDLERS
 # ─────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -262,7 +279,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def new_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    orders[user_id] = {"table": None, "table_label": None, "items": [], "page": 0}
+    orders[user_id] = {"table": None, "table_label": None, "items": [], "page": 0, "comment": None}
+    awaiting_comment.pop(user_id, None)
     await update.message.reply_text("Вибери зону:", reply_markup=build_zones_keyboard())
 
 async def rapport(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -274,6 +292,27 @@ async def rapport(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=DIRECTION_CHAT_ID, text=text, parse_mode="Markdown")
     await update.message.reply_text("✅ Звіт відправлено.")
 
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère le commentaire libre tapé par le serveur"""
+    user_id = update.message.from_user.id
+    if user_id not in awaiting_comment:
+        return
+    comment = update.message.text.strip()
+    if user_id in orders:
+        orders[user_id]["comment"] = comment
+    awaiting_comment.pop(user_id, None)
+    order = orders.get(user_id, {})
+    cart_text = format_cart(
+        order.get("table_label", "?"),
+        order.get("items", []),
+        comment
+    )
+    await update.message.reply_text(
+        f"📝 Коментар збережено.\n\n{cart_text}\n\nПеревір замовлення:",
+        reply_markup=build_cart_keyboard(),
+        parse_mode="Markdown"
+    )
+
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -283,18 +322,19 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "CANCEL":
         orders.pop(user_id, None)
+        awaiting_comment.pop(user_id, None)
         await query.edit_message_text("Замовлення скасовано.")
         return
 
     if data == "BACK_ZONES":
         if user_id not in orders:
-            orders[user_id] = {"table": None, "table_label": None, "items": [], "page": 0}
+            orders[user_id] = {"table": None, "table_label": None, "items": [], "page": 0, "comment": None}
         await query.edit_message_text("Вибери зону:", reply_markup=build_zones_keyboard())
         return
 
     if data.startswith("ZONE_"):
         if user_id not in orders:
-            orders[user_id] = {"table": None, "table_label": None, "items": [], "page": 0}
+            orders[user_id] = {"table": None, "table_label": None, "items": [], "page": 0, "comment": None}
         zone_id = data.replace("ZONE_", "")
         tables_data = load_tables()
         zone = next((z for z in tables_data["zones"] if z["id"] == zone_id), None)
@@ -308,7 +348,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("TABLE_"):
         if user_id not in orders:
-            orders[user_id] = {"table": None, "table_label": None, "items": [], "page": 0}
+            orders[user_id] = {"table": None, "table_label": None, "items": [], "page": 0, "comment": None}
         parts = data.split("_")
         zone_id = parts[1]
         table_num = parts[2]
@@ -332,7 +372,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = int(data.replace("PAGE_", ""))
         orders[user_id]["page"] = page
         order = orders[user_id]
-        cart_text = format_cart(order.get("table_label", "?"), order["items"])
+        cart_text = format_cart(order.get("table_label", "?"), order["items"], order.get("comment"))
         await query.edit_message_text(
             f"{cart_text}\n\nВибери страву:",
             reply_markup=build_menu_keyboard(page),
@@ -348,7 +388,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         orders[user_id]["items"].append(item_id)
         order = orders[user_id]
         page = order.get("page", 0)
-        cart_text = format_cart(order.get("table_label", "?"), order["items"])
+        cart_text = format_cart(order.get("table_label", "?"), order["items"], order.get("comment"))
         await query.edit_message_text(
             f"✓ Додано\n\n{cart_text}\n\nДодай ще або переглянь кошик:",
             reply_markup=build_menu_keyboard(page),
@@ -361,10 +401,21 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Сесія закінчилась. Натисни /new")
             return
         order = orders[user_id]
-        cart_text = format_cart(order.get("table_label", "?"), order["items"])
+        cart_text = format_cart(order.get("table_label", "?"), order["items"], order.get("comment"))
         await query.edit_message_text(
             f"{cart_text}\n\nПеревір замовлення:",
             reply_markup=build_cart_keyboard(),
+            parse_mode="Markdown"
+        )
+        return
+
+    if data == "ADD_COMMENT":
+        if user_id not in orders:
+            await query.edit_message_text("Сесія закінчилась. Натисни /new")
+            return
+        awaiting_comment[user_id] = True
+        await query.edit_message_text(
+            "📝 Напиши коментар до замовлення\n_(алергія, побажання, без солі, тощо)_\n\nПросто надішли текст:",
             parse_mode="Markdown"
         )
         return
@@ -377,7 +428,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not order["items"]:
             await query.answer("Кошик порожній", show_alert=True)
             return
-        cart_text = format_cart(order.get("table_label", "?"), order["items"])
+        cart_text = format_cart(order.get("table_label", "?"), order["items"], order.get("comment"))
         await query.edit_message_text(
             f"{cart_text}\n\nЩо прибрати?",
             reply_markup=build_remove_keyboard(order["items"]),
@@ -393,7 +444,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order = orders[user_id]
         if item_id in order["items"]:
             order["items"].remove(item_id)
-        cart_text = format_cart(order.get("table_label", "?"), order["items"])
+        cart_text = format_cart(order.get("table_label", "?"), order["items"], order.get("comment"))
         if not order["items"]:
             await query.edit_message_text(
                 "Кошик порожній. Вибери страви:",
@@ -415,11 +466,12 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order = orders[user_id]
         table_label = order.get("table_label", "?")
         items = order["items"]
+        comment = order.get("comment")
         if not items:
             await query.answer("Кошик порожній! Додай страви.", show_alert=True)
             return
         order_id = next_order_id()
-        kitchen_text = format_order_for_kitchen(order_id, table_label, items, waiter_name)
+        kitchen_text = format_order_for_kitchen(order_id, table_label, items, waiter_name, comment)
         record_order(items)
         order_waiter[order_id] = user_id
         await context.bot.send_message(
@@ -429,10 +481,12 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         await query.edit_message_text(
-            f"Замовлення #{order_id} відправлено.\n\n{format_cart(table_label, items)}",
+            f"Замовлення #{order_id} відправлено.\n\n{format_cart(table_label, items, comment)}",
             parse_mode="Markdown"
         )
         orders.pop(user_id, None)
+        # Lancer le rappel en arrière-plan
+        asyncio.create_task(send_reminder(order_id, user_id, table_label, context.bot))
         return
 
     if data.startswith("STATUS_"):
@@ -465,12 +519,23 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif status == "READY":
             new_text = query.message.text + f"\n\n— Готово ({now})"
-            await query.edit_message_text(new_text, reply_markup=InlineKeyboardMarkup([]), parse_mode="Markdown")
+            await query.edit_message_text(
+                new_text,
+                reply_markup=InlineKeyboardMarkup([]),
+                parse_mode="Markdown"
+            )
             if order_id_int and order_id_int in order_waiter:
+                waiter_id = order_waiter[order_id_int]
                 try:
+                    # Message bien visible
                     await context.bot.send_message(
-                        chat_id=order_waiter[order_id_int],
-                        text=f"✓ Замовлення #{order_id_str} — готово, можна подавати. ({now})"
+                        chat_id=waiter_id,
+                        text=f"‼️ ЗАМОВЛЕННЯ #{order_id_str} ГОТОВЕ ‼️\n\nМОЖНА ПОДАВАТИ ({now})"
+                    )
+                    # Sticker "cloche" / célébration
+                    await context.bot.send_sticker(
+                        chat_id=waiter_id,
+                        sticker="CAACAgIAAxkBAAIBmGYV1c2v8gHSsV0Hx3hLSAAB0Ew2AAJoAQACIjaOC0rBHMJj3Ro1HgQ"
                     )
                 except Exception:
                     pass
@@ -484,9 +549,10 @@ application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("new", new_order))
 application.add_handler(CommandHandler("rapport", rapport))
 application.add_handler(CallbackQueryHandler(button))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
 # ─────────────────────────────────────────────
-#  FLASK — WEBHOOK + RAPPORTS AUTOMATIQUES
+#  FLASK
 # ─────────────────────────────────────────────
 @app_flask.route("/", methods=["POST"])
 async def webhook():
@@ -501,24 +567,19 @@ def health():
 
 @app_flask.route("/daily", methods=["GET", "POST"])
 async def daily_report():
-    """Appelé par cron-job.org chaque soir à 23h"""
-    yesterday = datetime.now().strftime("%Y-%m-%d")
+    from datetime import timedelta
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     text = build_daily_report(yesterday)
     await application.bot.send_message(
-        chat_id=DIRECTION_CHAT_ID,
-        text=text,
-        parse_mode="Markdown"
+        chat_id=DIRECTION_CHAT_ID, text=text, parse_mode="Markdown"
     )
     return "ok"
 
 @app_flask.route("/monthly", methods=["GET", "POST"])
 async def monthly_report():
-    """Appelé par cron-job.org le 1er de chaque mois à 9h"""
     text = build_monthly_report()
     await application.bot.send_message(
-        chat_id=DIRECTION_CHAT_ID,
-        text=text,
-        parse_mode="Markdown"
+        chat_id=DIRECTION_CHAT_ID, text=text, parse_mode="Markdown"
     )
     return "ok"
 
