@@ -18,6 +18,10 @@ from telegram.ext import (
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 KITCHEN_CHAT_ID = int(os.environ["KITCHEN_CHAT_ID"])
 ADMIN_ID = int(os.environ["ADMIN_ID"])
+# IDs des cuisiniers/restaurant séparés par virgule ex: "123456,789012"
+KITCHEN_USER_IDS = set(
+    int(x.strip()) for x in os.environ.get("KITCHEN_USER_IDS", "").split(",") if x.strip()
+)
 STATS_FILE = "stats.json"
 
 app_flask = Flask(__name__)
@@ -92,6 +96,8 @@ def build_rapport(month_key):
 # ─────────────────────────────────────────────
 orders = {}
 order_counter = {"n": 0}
+# Stocke waiter_id par order_id pour la notification
+order_waiter = {}
 
 def next_order_id():
     order_counter["n"] += 1
@@ -136,7 +142,7 @@ def build_zones_keyboard():
     rows = []
     for zone in tables_data["zones"]:
         rows.append([InlineKeyboardButton(zone["name"], callback_data=f"ZONE_{zone['id']}")])
-    rows.append([InlineKeyboardButton("❌ Скасувати", callback_data="CANCEL")])
+    rows.append([InlineKeyboardButton("Скасувати", callback_data="CANCEL")])
     return InlineKeyboardMarkup(rows)
 
 def build_tables_keyboard(zone_id):
@@ -153,7 +159,7 @@ def build_tables_keyboard(zone_id):
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK_ZONES")])
+    rows.append([InlineKeyboardButton("← Назад", callback_data="BACK_ZONES")])
     return InlineKeyboardMarkup(rows)
 
 def build_menu_keyboard(page=0):
@@ -177,16 +183,16 @@ def build_menu_keyboard(page=0):
     if nav:
         rows.append(nav)
 
-    rows.append([InlineKeyboardButton("🛒 Переглянути кошик", callback_data="SHOW_CART")])
-    rows.append([InlineKeyboardButton("❌ Скасувати", callback_data="CANCEL")])
+    rows.append([InlineKeyboardButton("Переглянути кошик", callback_data="SHOW_CART")])
+    rows.append([InlineKeyboardButton("Скасувати", callback_data="CANCEL")])
     return InlineKeyboardMarkup(rows)
 
 def build_cart_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Додати ще", callback_data="PAGE_0")],
-        [InlineKeyboardButton("🗑 Прибрати страву", callback_data="REMOVE_LIST")],
-        [InlineKeyboardButton("✅ Відправити замовлення", callback_data="SEND")],
-        [InlineKeyboardButton("❌ Скасувати", callback_data="CANCEL")],
+        [InlineKeyboardButton("Додати ще", callback_data="PAGE_0")],
+        [InlineKeyboardButton("Прибрати страву", callback_data="REMOVE_LIST")],
+        [InlineKeyboardButton("✓ Відправити замовлення", callback_data="SEND")],
+        [InlineKeyboardButton("Скасувати", callback_data="CANCEL")],
     ])
 
 def build_remove_keyboard(items_in_cart):
@@ -198,17 +204,17 @@ def build_remove_keyboard(items_in_cart):
         if item_id not in seen:
             seen.append(item_id)
             count = items_in_cart.count(item_id)
-            label = f"🗑 {item_lookup.get(item_id, item_id)}"
+            label = item_lookup.get(item_id, item_id)
             if count > 1:
                 label += f" ×{count}"
-            rows.append([InlineKeyboardButton(label, callback_data=f"REMOVE_{item_id}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="SHOW_CART")])
+            rows.append([InlineKeyboardButton(f"− {label}", callback_data=f"REMOVE_{item_id}")])
+    rows.append([InlineKeyboardButton("← Назад", callback_data="SHOW_CART")])
     return InlineKeyboardMarkup(rows)
 
 def build_kitchen_keyboard(order_id):
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("👨‍🍳 Готується", callback_data=f"STATUS_COOKING_{order_id}"),
-        InlineKeyboardButton("✅ Готово", callback_data=f"STATUS_READY_{order_id}"),
+        InlineKeyboardButton("Готується", callback_data=f"STATUS_COOKING_{order_id}"),
+        InlineKeyboardButton("Готово", callback_data=f"STATUS_READY_{order_id}"),
     ]])
 
 # ─────────────────────────────────────────────
@@ -223,7 +229,7 @@ async def new_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     orders[user_id] = {"table": None, "table_label": None, "items": [], "page": 0}
     await update.message.reply_text(
-        "🌊 Вибери зону:",
+        "Вибери зону:",
         reply_markup=build_zones_keyboard()
     )
 
@@ -236,7 +242,7 @@ async def rapport(update: Update, context: ContextTypes.DEFAULT_TYPE):
     month_key = f"{now.year - 1}-12" if now.month == 1 else f"{now.year}-{now.month - 1:02d}"
     text = build_rapport(month_key)
     await context.bot.send_message(chat_id=KITCHEN_CHAT_ID, text=text, parse_mode="Markdown")
-    await update.message.reply_text("✅ Звіт відправлено на кухню.")
+    await update.message.reply_text("✅ Звіт відправлено.")
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -248,14 +254,14 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # CANCEL
     if data == "CANCEL":
         orders.pop(user_id, None)
-        await query.edit_message_text("❌ Замовлення скасовано.")
+        await query.edit_message_text("Замовлення скасовано.")
         return
 
     # BACK TO ZONES
     if data == "BACK_ZONES":
         if user_id not in orders:
             orders[user_id] = {"table": None, "table_label": None, "items": [], "page": 0}
-        await query.edit_message_text("🌊 Вибери зону:", reply_markup=build_zones_keyboard())
+        await query.edit_message_text("Вибери зону:", reply_markup=build_zones_keyboard())
         return
 
     # ZONE SELECTED
@@ -268,7 +274,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         zone_name = zone["name"] if zone else zone_id
         orders[user_id]["zone_id"] = zone_id
         await query.edit_message_text(
-            f"{zone_name}\n\nВибери стіл:",
+            f"{zone_name} — вибери стіл:",
             reply_markup=build_tables_keyboard(zone_id)
         )
         return
@@ -283,7 +289,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tables_data = load_tables()
         zone = next((z for z in tables_data["zones"] if z["id"] == zone_id), None)
         zone_name = zone["name"] if zone else zone_id
-        table_label = f"{zone_name} — стіл {table_num}"
+        table_label = f"{zone_name}, стіл {table_num}"
         orders[user_id]["table"] = table_num
         orders[user_id]["table_label"] = table_label
         await query.edit_message_text(
@@ -319,9 +325,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order = orders[user_id]
         page = order.get("page", 0)
         cart_text = format_cart(order.get("table_label", "?"), order["items"])
-        item_name = get_item_name(item_id)
         await query.edit_message_text(
-            f"✅ Додано!\n\n{cart_text}\n\nДодай ще або переглянь кошик:",
+            f"✓ Додано\n\n{cart_text}\n\nДодай ще або переглянь кошик:",
             reply_markup=build_menu_keyboard(page),
             parse_mode="Markdown"
         )
@@ -352,7 +357,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         cart_text = format_cart(order.get("table_label", "?"), order["items"])
         await query.edit_message_text(
-            f"{cart_text}\n\n🗑 Що прибрати?",
+            f"{cart_text}\n\nЩо прибрати?",
             reply_markup=build_remove_keyboard(order["items"]),
             parse_mode="Markdown"
         )
@@ -370,13 +375,13 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cart_text = format_cart(order.get("table_label", "?"), order["items"])
         if not order["items"]:
             await query.edit_message_text(
-                "🛒 Кошик порожній.\n\nВибери страви:",
+                "Кошик порожній. Вибери страви:",
                 reply_markup=build_menu_keyboard(0),
                 parse_mode="Markdown"
             )
         else:
             await query.edit_message_text(
-                f"{cart_text}\n\n🗑 Ще прибрати?",
+                f"{cart_text}\n\nЩе прибрати?",
                 reply_markup=build_remove_keyboard(order["items"]),
                 parse_mode="Markdown"
             )
@@ -396,6 +401,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_id = next_order_id()
         kitchen_text = format_order_for_kitchen(order_id, table_label, items, waiter_name)
         record_order(items)
+        # Mémoriser le waiter pour la notification
+        order_waiter[order_id] = user_id
         await context.bot.send_message(
             chat_id=KITCHEN_CHAT_ID,
             text=kitchen_text,
@@ -403,29 +410,60 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         await query.edit_message_text(
-            f"🌈 Замовлення #{order_id} відправлено!\n\n{format_cart(table_label, items)}",
+            f"Замовлення #{order_id} відправлено.\n\n{format_cart(table_label, items)}",
             parse_mode="Markdown"
         )
         orders.pop(user_id, None)
         return
 
-    # KITCHEN STATUS
+    # KITCHEN STATUS — réservé aux cuisiniers
     if data.startswith("STATUS_"):
+        # Vérifier que c'est bien un cuisinier
+        if KITCHEN_USER_IDS and user_id not in KITCHEN_USER_IDS:
+            await query.answer("⛔️ Тільки для кухні.", show_alert=True)
+            return
+
         parts = data.split("_")
         status = parts[1]
-        order_id = parts[2] if len(parts) > 2 else "?"
+        order_id_str = parts[2] if len(parts) > 2 else "?"
         now = datetime.now().strftime("%H:%M")
+
+        try:
+            order_id_int = int(order_id_str)
+        except ValueError:
+            order_id_int = None
+
         if status == "COOKING":
-            new_text = query.message.text + f"\n\n👨‍🍳 *Готується* — {now}"
+            new_text = query.message.text + f"\n\n— Готується ({now})"
             new_keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Готово", callback_data=f"STATUS_READY_{order_id}")
+                InlineKeyboardButton("Готово", callback_data=f"STATUS_READY_{order_id_str}")
             ]])
+            await query.edit_message_text(new_text, reply_markup=new_keyboard, parse_mode="Markdown")
+            # Notifier le serveur
+            if order_id_int and order_id_int in order_waiter:
+                waiter_id = order_waiter[order_id_int]
+                try:
+                    await context.bot.send_message(
+                        chat_id=waiter_id,
+                        text=f"🍷 Замовлення #{order_id_str} — кухня прийняла, готується. ({now})"
+                    )
+                except Exception:
+                    pass
+
         elif status == "READY":
-            new_text = query.message.text + f"\n\n✅ *Готово!* 💃 — {now}"
-            new_keyboard = InlineKeyboardMarkup([])
-        else:
-            return
-        await query.edit_message_text(new_text, reply_markup=new_keyboard, parse_mode="Markdown")
+            new_text = query.message.text + f"\n\n— Готово ({now})"
+            await query.edit_message_text(new_text, reply_markup=InlineKeyboardMarkup([]), parse_mode="Markdown")
+            # Notifier le serveur
+            if order_id_int and order_id_int in order_waiter:
+                waiter_id = order_waiter[order_id_int]
+                try:
+                    await context.bot.send_message(
+                        chat_id=waiter_id,
+                        text=f"✓ Замовлення #{order_id_str} — готово, можна подавати. ({now})"
+                    )
+                except Exception:
+                    pass
+                order_waiter.pop(order_id_int, None)
         return
 
 # ─────────────────────────────────────────────
@@ -448,7 +486,7 @@ async def webhook():
 
 @app_flask.route("/", methods=["GET"])
 def health():
-    return "bandôl 🍷 — alive"
+    return "bandôl — alive"
 
 if __name__ == "__main__":
     asyncio.run(application.initialize())
