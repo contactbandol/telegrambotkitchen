@@ -21,9 +21,6 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 KITCHEN_CHAT_ID = int(os.environ["KITCHEN_CHAT_ID"])
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 DIRECTION_CHAT_ID = int(os.environ["DIRECTION_CHAT_ID"])
-KITCHEN_USER_IDS = set(
-    int(x.strip()) for x in os.environ.get("KITCHEN_USER_IDS", "").split(",") if x.strip()
-)
 STATS_FILE = "stats.json"
 REMINDER_MINUTES = 4
 
@@ -490,9 +487,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("STATUS_"):
-        if KITCHEN_USER_IDS and user_id not in KITCHEN_USER_IDS:
-            await query.answer("⛔️ Тільки для кухні.", show_alert=True)
-            return
         parts = data.split("_")
         status = parts[1]
         order_id_str = parts[2] if len(parts) > 2 else "?"
