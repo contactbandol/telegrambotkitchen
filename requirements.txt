@@ -1,0 +1,4 @@
+python-telegram-bot[webhooks]==21.3
+flask[async]==3.0.3
+gunicorn==21.2.0
+gevent==23.9.1
